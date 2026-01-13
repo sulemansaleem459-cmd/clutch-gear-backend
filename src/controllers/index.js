@@ -14,6 +14,7 @@ const adminController = require("./admin.controller");
 const uploadController = require("./upload.controller");
 const superadminController = require("./superadmin.controller");
 const enquiryController = require("./enquiry.controller");
+const inventoryController = require("./inventory.controller");
 
 module.exports = {
   authController,
@@ -28,4 +29,5 @@ module.exports = {
   uploadController,
   superadminController,
   enquiryController,
+  inventoryController,
 };

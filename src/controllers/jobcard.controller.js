@@ -26,6 +26,54 @@ const ensureMechanicAssigned = (jobCard, mechanicUserId) => {
   }
 };
 
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
+
+const normalizeJobItems = (jobItems = []) => {
+  if (!Array.isArray(jobItems)) return [];
+  return jobItems.map((item) => {
+    const quantity = Math.max(1, Number(item.quantity || 1));
+    const unitPrice = Math.max(0, Number(item.unitPrice || 0));
+    const discountPct = Math.min(Math.max(Number(item.discount || 0), 0), 100);
+    const lineTotal = quantity * unitPrice;
+    const discountAmount = (lineTotal * discountPct) / 100;
+    const total = Math.max(0, lineTotal - discountAmount);
+
+    return {
+      ...item,
+      quantity,
+      unitPrice,
+      discount: discountPct,
+      total: round2(total),
+    };
+  });
+};
+
+const ensureJobCardImageArrays = (jobCard) => {
+  if (!jobCard.images) {
+    jobCard.images = { beforeService: [], afterService: [] };
+  }
+  if (!Array.isArray(jobCard.images.beforeService)) {
+    jobCard.images.beforeService = [];
+  }
+  if (!Array.isArray(jobCard.images.afterService)) {
+    jobCard.images.afterService = [];
+  }
+};
+
+const maybeRecalculateBilling = async (jobCard) => {
+  if (!jobCard) return;
+  const items = Array.isArray(jobCard.jobItems) ? jobCard.jobItems : [];
+  const hasPricedItems = items.some((i) => Number(i?.total || 0) > 0);
+  const grandTotal = Number(jobCard.billing?.grandTotal || 0);
+
+  // If billing is missing/zero but items exist, recompute & persist.
+  if (hasPricedItems && grandTotal <= 0) {
+    jobCard.set("jobItems", normalizeJobItems(items));
+    jobCard.calculateBilling();
+    await jobCard.save();
+  }
+};
+
 /**
  * @desc    Get user's job cards
  * @route   GET /api/v1/jobcards
@@ -74,6 +122,8 @@ const getJobCard = asyncHandler(async (req, res) => {
     throw ApiError.notFound("Job card not found");
   }
 
+  await maybeRecalculateBilling(jobCard);
+
   const { totalPaid, count } = await Payment.getJobCardPayments(jobCard._id);
   const grandTotal = Number(jobCard.billing?.grandTotal || 0);
   const balanceDue = Math.max(
@@ -120,7 +170,7 @@ const approveJobItems = asyncHandler(async (req, res) => {
   });
 
   // Calculate billing
-  jobCard.calculateBilling();
+  jobCard.calculateBilling({ onlyApproved: true });
 
   // Check if all items are approved
   const pendingItems = jobCard.jobItems.filter((item) => !item.isApproved);
@@ -232,6 +282,8 @@ const getJobCardById = asyncHandler(async (req, res) => {
     throw ApiError.notFound("Job card not found");
   }
 
+  await maybeRecalculateBilling(jobCard);
+
   const { totalPaid, count } = await Payment.getJobCardPayments(jobCard._id);
   const grandTotal = Number(jobCard.billing?.grandTotal || 0);
   const balanceDue = Math.max(
@@ -266,6 +318,7 @@ const createJobCard = asyncHandler(async (req, res) => {
     customerComplaints,
     services,
     jobItems,
+    mechanicUserIds,
     notes,
   } = req.body;
 
@@ -286,6 +339,8 @@ const createJobCard = asyncHandler(async (req, res) => {
     throw ApiError.notFound("Vehicle not found");
   }
 
+  const normalizedItems = normalizeJobItems(jobItems);
+
   // Create job card
   const jobCard = await JobCard.create({
     customer: customerId,
@@ -302,7 +357,7 @@ const createJobCard = asyncHandler(async (req, res) => {
     fuelLevel,
     customerComplaints,
     services,
-    jobItems,
+    jobItems: normalizedItems,
     notes,
     statusHistory: [
       {
@@ -313,6 +368,47 @@ const createJobCard = asyncHandler(async (req, res) => {
       },
     ],
   });
+
+  // Ensure billing totals are available immediately (for admin views + payments)
+  jobCard.calculateBilling();
+  await jobCard.save();
+
+  // Optional: assign mechanics during creation
+  if (Array.isArray(mechanicUserIds) && mechanicUserIds.length > 0) {
+    const uniqueIds = toUniqueStringIds(mechanicUserIds);
+
+    const mechanics = await User.find({
+      _id: { $in: uniqueIds },
+      role: "mechanic",
+      isActive: true,
+    })
+      .select("name mobile deviceInfo")
+      .lean();
+
+    if (mechanics.length !== uniqueIds.length) {
+      throw ApiError.badRequest(
+        "One or more mechanicUserIds are invalid or not mechanics"
+      );
+    }
+
+    jobCard.assignedMechanicUserIds = uniqueIds;
+    jobCard.assignedMechanics = mechanics.map((m) => ({
+      name: m.name,
+      mobile: m.mobile,
+      specialization: "",
+    }));
+
+    await jobCard.save();
+
+    // Notify mechanics about assignment
+    try {
+      for (const mechanic of mechanics) {
+        await fcmService.notifyMechanicAssignment(mechanic, jobCard);
+      }
+    } catch (error) {
+      console.error("Push notification to mechanics failed:", error);
+    }
+  }
 
   // Update appointment status if linked
   if (appointmentId) {
@@ -440,6 +536,8 @@ const assignMechanics = asyncHandler(async (req, res) => {
     throw ApiError.notFound("Job card not found");
   }
 
+  ensureJobCardImageArrays(jobCard);
+
   const mechanics = await User.find({
     _id: { $in: uniqueIds },
     role: "mechanic",
@@ -563,6 +661,8 @@ const updateAssignedJobCardStatus = asyncHandler(async (req, res) => {
 
   ensureMechanicAssigned(jobCard, req.userId);
 
+  ensureJobCardImageArrays(jobCard);
+
   if (status !== jobCard.status) {
     if (status === "delivered") {
       if (jobCard.status !== "ready") {
@@ -645,18 +745,23 @@ const addJobItem = asyncHandler(async (req, res) => {
     throw ApiError.notFound("Job card not found");
   }
 
-  const lineTotal = Number(quantity) * Number(unitPrice);
-  const safeDiscount = Math.min(Math.max(Number(discount || 0), 0), lineTotal);
-  const total = Math.max(0, lineTotal - safeDiscount);
+  const safeQty = Math.max(1, Number(quantity || 1));
+  const safeUnitPrice = Math.max(0, Number(unitPrice || 0));
+  const discountPct = Math.min(Math.max(Number(discount || 0), 0), 100);
+  const lineTotal = safeQty * safeUnitPrice;
+  const discountAmount = (lineTotal * discountPct) / 100;
+  const total = Math.max(0, lineTotal - discountAmount);
 
   jobCard.jobItems.push({
     type,
     description,
-    quantity,
-    unitPrice,
-    discount: safeDiscount,
-    total,
+    quantity: safeQty,
+    unitPrice: safeUnitPrice,
+    discount: discountPct,
+    total: round2(total),
   });
+
+  jobCard.calculateBilling();
 
   // If there are unapproved items, set status to awaiting-approval
   if (jobCard.status === "inspection" || jobCard.status === "in-progress") {

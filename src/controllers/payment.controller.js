@@ -193,6 +193,88 @@ const createRazorpayOrderForPayment = asyncHandler(async (req, res) => {
 });
 
 /**
+ * @desc    Create Razorpay order for an existing pending payment (Admin)
+ * @route   POST /api/v1/admin/payments/:id/razorpay/order
+ * @access  Private/Admin
+ */
+const createRazorpayOrderForPaymentAdmin = asyncHandler(async (req, res) => {
+  const payment = await Payment.findById(req.params.id).populate("jobCard");
+
+  if (!payment) {
+    throw ApiError.notFound("Payment not found");
+  }
+
+  if (payment.paymentType === "refund") {
+    throw ApiError.badRequest("Refunds cannot be paid online");
+  }
+
+  if (payment.status !== "pending") {
+    throw ApiError.badRequest("Only pending payments can be paid online");
+  }
+
+  const jobCardId = payment.jobCard?._id || payment.jobCard;
+  const jobCard = await JobCard.findById(jobCardId);
+  if (!jobCard) {
+    throw ApiError.notFound("Job card not found");
+  }
+
+  const existingPayments = await Payment.getJobCardPayments(jobCardId);
+  const balanceDue = jobCard.billing.grandTotal - existingPayments.totalPaid;
+
+  if (payment.amount > balanceDue) {
+    throw ApiError.badRequest(
+      `Payment amount exceeds balance due (₹${balanceDue})`
+    );
+  }
+
+  let razorpay;
+  try {
+    razorpay = getRazorpayClient();
+  } catch (e) {
+    throw ApiError.serviceUnavailable(
+      "Razorpay is not configured on the server"
+    );
+  }
+
+  const amountPaise = Math.round(Number(payment.amount) * 100);
+  if (!Number.isFinite(amountPaise) || amountPaise <= 0) {
+    throw ApiError.badRequest("Invalid payment amount");
+  }
+
+  const order = await razorpay.orders.create({
+    amount: amountPaise,
+    currency: "INR",
+    receipt: payment.paymentNumber,
+    notes: {
+      paymentId: String(payment._id),
+      jobCardId: String(jobCardId),
+    },
+  });
+
+  const token = createCheckoutToken();
+  const expiresAt = new Date(
+    Date.now() + CHECKOUT_TOKEN_TTL_MINUTES * 60 * 1000
+  );
+
+  payment.transactionDetails = {
+    ...(payment.transactionDetails || {}),
+    gateway: "razorpay",
+    orderId: order.id,
+  };
+  payment.checkout = { token, expiresAt };
+  await payment.save();
+
+  ApiResponse.success(res, "Razorpay order created", {
+    orderId: order.id,
+    amountPaise,
+    currency: order.currency,
+    checkoutUrl: buildCheckoutUrl(req, token),
+    keyId: getRazorpayKeyId(),
+    expiresAt,
+  });
+});
+
+/**
  * @desc    Hosted Razorpay checkout (tokenized)
  * @route   GET /api/v1/payments/razorpay/checkout/:token
  * @access  Public (token)
@@ -273,7 +355,19 @@ const renderRazorpayCheckout = asyncHandler(async (req, res) => {
       const msg = document.getElementById('msg');
       function setMsg(text) { msg.textContent = text || ''; }
 
-      payBtn.addEventListener('click', function () {
+      function postToReactNative(payload) {
+        try {
+          if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') {
+            window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+          }
+        } catch (_) {
+          // no-op
+        }
+      }
+
+      function startCheckout() {
+        if (payBtn.disabled) return;
+
         payBtn.disabled = true;
         setMsg('Opening Razorpay...');
 
@@ -302,15 +396,18 @@ const renderRazorpayCheckout = asyncHandler(async (req, res) => {
                 throw new Error((data && data.message) || 'Verification failed');
               }
               setMsg('Payment successful. You can return to the app.');
+              postToReactNative({ type: 'razorpay', status: 'success' });
             } catch (e) {
               setMsg('Payment verification failed. Please contact support.');
               payBtn.disabled = false;
+              postToReactNative({ type: 'razorpay', status: 'failed' });
             }
           },
           modal: {
             ondismiss: function () {
               setMsg('Payment cancelled.');
               payBtn.disabled = false;
+              postToReactNative({ type: 'razorpay', status: 'cancelled' });
             }
           },
           prefill: {
@@ -321,14 +418,22 @@ const renderRazorpayCheckout = asyncHandler(async (req, res) => {
 
         const rzp = new Razorpay(options);
         rzp.open();
-      });
+
+      }
+
+      payBtn.addEventListener('click', startCheckout);
+
+      // Auto-launch when embedded in a WebView (in-app payment)
+      setTimeout(function () {
+        startCheckout();
+      }, 350);
     </script>
   </body>
 </html>`);
 });
 
 /**
- * @desc    Verify Razorpay signature and mark payment completed
+ * @desc    Verify Razorpay signature and mark payment completed (WebView/token flow)
  * @route   POST /api/v1/payments/razorpay/verify
  * @access  Public (token)
  */
@@ -388,6 +493,67 @@ const verifyRazorpayPayment = asyncHandler(async (req, res) => {
   await payment.save();
 
   ApiResponse.success(res, "Payment verified", {
+    paymentId: payment._id,
+    status: payment.status,
+  });
+});
+
+/**
+ * @desc    Verify Razorpay signature for native SDK (paymentId flow)
+ * @route   POST /api/v1/admin/payments/:id/razorpay/verify
+ * @access  Private/Admin
+ */
+const verifyRazorpayPaymentNative = asyncHandler(async (req, res) => {
+  const { razorpay_payment_id, razorpay_order_id, razorpay_signature } =
+    req.body || {};
+
+  if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+    throw ApiError.badRequest("Missing Razorpay verification fields");
+  }
+
+  const payment = await Payment.findById(req.params.id);
+  if (!payment) {
+    throw ApiError.notFound("Payment not found");
+  }
+
+  if (payment.status !== "pending") {
+    throw ApiError.badRequest("Payment is not pending");
+  }
+
+  const expectedOrderId = payment.transactionDetails?.orderId;
+  if (!expectedOrderId || expectedOrderId !== razorpay_order_id) {
+    throw ApiError.badRequest("Order ID mismatch");
+  }
+
+  const secret = process.env.RAZORPAY_KEY_SECRET;
+  if (!secret) {
+    throw ApiError.serviceUnavailable(
+      "Razorpay is not configured on the server"
+    );
+  }
+
+  const body = `${razorpay_order_id}|${razorpay_payment_id}`;
+  const expectedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(body)
+    .digest("hex");
+
+  if (expectedSignature !== razorpay_signature) {
+    throw ApiError.badRequest("Invalid payment signature");
+  }
+
+  payment.status = "completed";
+  payment.transactionId = razorpay_payment_id;
+  payment.transactionDetails = {
+    ...(payment.transactionDetails || {}),
+    gateway: "razorpay",
+    orderId: razorpay_order_id,
+    signature: razorpay_signature,
+  };
+  payment.checkout = undefined;
+  await payment.save();
+
+  ApiResponse.success(res, "Payment verified and completed", {
     paymentId: payment._id,
     status: payment.status,
   });
@@ -753,6 +919,8 @@ module.exports = {
   verifyRazorpayPayment,
   // Admin
   getAllPayments,
+  createRazorpayOrderForPaymentAdmin,
+  verifyRazorpayPaymentNative,
   createPayment,
   updatePayment,
   processRefund,

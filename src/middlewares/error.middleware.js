@@ -11,10 +11,29 @@ const ApiError = require("../utils/apiError");
 const errorConverter = (err, req, res, next) => {
   let error = err;
 
+  // Normalize errors field early so downstream handlers can safely read it.
+  const normalizeErrors = (value) => (Array.isArray(value) ? value : []);
+
   if (!(error instanceof ApiError)) {
-    const statusCode = error.statusCode || 500;
-    const message = error.message || "Internal Server Error";
-    error = new ApiError(statusCode, message, [], false);
+    const statusCode = err?.statusCode || 500;
+    const message = err?.message || "Internal Server Error";
+    const converted = new ApiError(
+      statusCode,
+      message,
+      normalizeErrors(err?.errors),
+      false
+    );
+
+    // Preserve the original stack so logs point to the real source.
+    if (err?.stack) {
+      converted.stack = err.stack;
+    }
+    // Keep a little extra debugging context (dev only output is handled in errorHandler)
+    converted.originalName = err?.name;
+
+    error = converted;
+  } else {
+    error.errors = normalizeErrors(error.errors);
   }
 
   next(error);
@@ -25,6 +44,7 @@ const errorConverter = (err, req, res, next) => {
  */
 const errorHandler = (err, req, res, next) => {
   let { statusCode, message, errors } = err;
+  errors = Array.isArray(errors) ? errors : [];
 
   // Default to 500 if no status code
   statusCode = statusCode || 500;

@@ -17,6 +17,7 @@ const uploadRoutes = require("./upload.routes");
 const adminRoutes = require("./admin.routes");
 const superadminRoutes = require("./superadmin.routes");
 const mechanicRoutes = require("./mechanic.routes");
+const inventoryRoutes = require("./inventory.routes");
 
 // Health check
 router.get("/health", (req, res) => {
@@ -38,6 +39,7 @@ router.use("/payments", paymentRoutes);
 router.use("/reviews", reviewRoutes);
 router.use("/upload", uploadRoutes);
 router.use("/admin", adminRoutes);
+router.use("/admin/inventory", inventoryRoutes);
 router.use("/superadmin", superadminRoutes);
 router.use("/mechanic", mechanicRoutes);
 

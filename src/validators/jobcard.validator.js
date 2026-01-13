@@ -31,6 +31,14 @@ const createJobCardValidation = [
     .optional()
     .isArray()
     .withMessage("Customer complaints must be an array"),
+  body("mechanicUserIds")
+    .optional()
+    .isArray({ min: 1 })
+    .withMessage("mechanicUserIds must be a non-empty array"),
+  body("mechanicUserIds.*")
+    .optional()
+    .isMongoId()
+    .withMessage("Invalid mechanic user ID"),
 ];
 
 const updateJobCardValidation = [

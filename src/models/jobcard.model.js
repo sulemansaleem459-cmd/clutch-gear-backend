@@ -242,8 +242,18 @@ jobCardSchema.pre("save", async function (next) {
 jobCardSchema.methods.calculateBilling = function () {
   const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-  const approvedItems = this.jobItems.filter((item) => item.isApproved);
-  const subtotal = approvedItems.reduce((sum, item) => sum + item.total, 0);
+  const opts = arguments.length > 0 ? arguments[0] || {} : {};
+  const onlyApproved = Boolean(opts.onlyApproved);
+
+  const items = Array.isArray(this.jobItems) ? this.jobItems : [];
+  const usedItems = onlyApproved
+    ? items.filter((item) => item.isApproved)
+    : items;
+
+  const subtotal = usedItems.reduce(
+    (sum, item) => sum + Number(item.total || 0),
+    0
+  );
   const discount = Math.max(0, Number(this.billing.discount || 0));
   const afterDiscount = Math.max(0, subtotal - discount);
   const taxRate = Number.isFinite(Number(this.billing.taxRate))
@@ -291,14 +301,16 @@ jobCardSchema.methods.updateStatus = async function (
  * Get pending approval items
  */
 jobCardSchema.virtual("pendingApprovalItems").get(function () {
-  return this.jobItems.filter((item) => !item.isApproved);
+  const items = Array.isArray(this.jobItems) ? this.jobItems : [];
+  return items.filter((item) => !item.isApproved);
 });
 
 /**
  * Get approved items total
  */
 jobCardSchema.virtual("approvedTotal").get(function () {
-  return this.jobItems
+  const items = Array.isArray(this.jobItems) ? this.jobItems : [];
+  return items
     .filter((item) => item.isApproved)
     .reduce((sum, item) => sum + item.total, 0);
 });

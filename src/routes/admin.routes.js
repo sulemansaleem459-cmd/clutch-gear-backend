@@ -248,6 +248,16 @@ router.post(
   validate,
   paymentController.createPayment
 );
+router.post(
+  "/payments/:id/razorpay/order",
+  validateObjectId("id"),
+  paymentController.createRazorpayOrderForPaymentAdmin
+);
+router.post(
+  "/payments/:id/razorpay/verify",
+  validateObjectId("id"),
+  paymentController.verifyRazorpayPaymentNative
+);
 router.put(
   "/payments/:id",
   validateObjectId("id"),

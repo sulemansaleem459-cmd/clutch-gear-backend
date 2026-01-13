@@ -34,6 +34,22 @@ const createPaymentValidation = [
     .trim()
     .isLength({ max: 100 })
     .withMessage("Transaction ID cannot exceed 100 characters"),
+  body("transactionId").custom((value, { req }) => {
+    const method = req.body?.paymentMethod;
+    const type = req.body?.paymentType;
+    const status = req.body?.status;
+
+    const isCash = method === "cash";
+    const isRefund = type === "refund";
+    const isPending = status === "pending";
+
+    if (isCash && !isRefund && !isPending) {
+      if (!value || String(value).trim().length === 0) {
+        throw new Error("Bill number is required for cash payments");
+      }
+    }
+    return true;
+  }),
   body("notes")
     .optional()
     .trim()
